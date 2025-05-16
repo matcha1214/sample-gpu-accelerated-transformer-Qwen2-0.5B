@@ -59,7 +59,7 @@ __global__ void rmsnorm_compute_rms_kernel(float *block_sum_squares, float *glob
         
         // Apply RMSNorm formula: RMS = sqrt(mean(squares)) = sqrt(Σ(a_i²)/n)
         float mean_squares = total_sum_squares / total_len;  // Mean of squared values
-        float rms = sqrtf(mean_squares + EPS);  // Add epsilon to prevent division by zero
+        float rms = sqrtf(mean_squares + LayerNorm::EPS);  // Add epsilon to prevent division by zero
         *global_rms = rms;  // Store the final RMS value
     }
 }
