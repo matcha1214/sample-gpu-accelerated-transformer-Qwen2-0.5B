@@ -2,6 +2,8 @@
 
 Caltech CS179 Transformer Project
 
+final score for the current implementation: 98/100
+
 # Background
 
 I recommend you read [Attention Is All You Need](https://arxiv.org/abs/1706.03762) many times, this paper is critical to all transformer models.
