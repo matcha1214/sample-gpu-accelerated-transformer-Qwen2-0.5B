@@ -68,12 +68,12 @@ __global__ void gqa_kernel(
     // With 14 query heads and 2 KV heads: heads 0-6 use KV head 0, heads 7-13 use KV head 1
     int kv_head_idx = head_idx * Qwen2Config::num_kv_heads() / Qwen2Config::num_query_heads();
     
-    // Shared memory for attention weights and intermediate results
-    extern __shared__ float sdata[];
-    float *s_attention_weights = sdata;
-    float *s_partial_sums = s_attention_weights + seq_len;
+    // Use global memory for attention weights to avoid shared memory limitations
+    float *attention_weights = temp_attention_weights + head_idx * seq_len;
     
-    // Step 1: Compute dot products between query and all keys
+    // Shared memory for reduction operations only
+    extern __shared__ float sdata[];
+    
     __nv_bfloat16 *query_head = queries + head_idx * Qwen2Config::head_size();
     
     // Each thread processes multiple sequence positions
@@ -93,34 +93,57 @@ __global__ void gqa_kernel(
         
         // Scale by 1/sqrt(head_size) for attention
         float scaled_dot = dot_product / sqrtf(static_cast<float>(Qwen2Config::head_size()));
-        s_attention_weights[pos] = scaled_dot;
+        attention_weights[pos] = scaled_dot;
     }
     __syncthreads();
     
-    // Step 2: Numerically stable softmax
-    // First find the maximum value
-    if (tid == 0) {
-        float max_val = s_attention_weights[0];
-        for (int i = 1; i < seq_len; i++) {
-            max_val = fmaxf(max_val, s_attention_weights[i]);
+    // Numerically stable softmax using online algorithm
+    // Step 1: Find maximum value
+    float thread_max = -INFINITY;
+    for (int pos = tid; pos < seq_len; pos += block_size) {
+        thread_max = fmaxf(thread_max, attention_weights[pos]);
+    }
+    
+    // Reduction to find global maximum
+    sdata[tid] = thread_max;
+    __syncthreads();
+    
+    for (int stride = block_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
         }
-        
-        // Compute exp(x - max) and sum
-        float sum_exp = 0.0f;
-        for (int i = 0; i < seq_len; i++) {
-            float exp_val = expf(s_attention_weights[i] - max_val);
-            s_attention_weights[i] = exp_val;
-            sum_exp += exp_val;
+        __syncthreads();
+    }
+    
+    float global_max = sdata[0];
+    __syncthreads();
+    
+    // Step 2: Compute sum of exponentials
+    float thread_sum = 0.0f;
+    for (int pos = tid; pos < seq_len; pos += block_size) {
+        thread_sum += expf(attention_weights[pos] - global_max);
+    }
+    
+    // Reduction to find global sum
+    sdata[tid] = thread_sum;
+    __syncthreads();
+    
+    for (int stride = block_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
         }
-        
-        // Normalize
-        for (int i = 0; i < seq_len; i++) {
-            s_attention_weights[i] /= sum_exp;
-        }
+        __syncthreads();
+    }
+    
+    float global_sum = sdata[0];
+    __syncthreads();
+    
+    // Step 3: Normalize to get probabilities
+    for (int pos = tid; pos < seq_len; pos += block_size) {
+        attention_weights[pos] = expf(attention_weights[pos] - global_max) / global_sum;
     }
     __syncthreads();
     
-    // Step 3: Compute weighted sum of values
     // Each thread computes part of the output vector
     for (int dim = tid; dim < Qwen2Config::value_size(); dim += block_size) {
         float weighted_sum = 0.0f;
@@ -133,7 +156,7 @@ __global__ void gqa_kernel(
                 layer_num * Qwen2Config::values_size() +
                 kv_head_idx * Qwen2Config::value_size();
             
-            weighted_sum += s_attention_weights[pos] * __bfloat162float(value_vec[dim]);
+            weighted_sum += attention_weights[pos] * __bfloat162float(value_vec[dim]);
         }
         
         // Store result
@@ -147,9 +170,8 @@ void GroupQueryAttention<QWEN2_SIZE>::sdpa(__nv_bfloat16 *queries, __nv_bfloat16
     int num_blocks = Qwen2Config::num_query_heads();
     int block_size = 256;  // threads per block
     
-    // Calculate shared memory requirements
-    // Need space for attention weights and partial sums
-    size_t shared_mem_size = (seq_len + block_size) * sizeof(float);
+    // Calculate shared memory requirements - only for reduction operations now
+    size_t shared_mem_size = block_size * sizeof(float);
     
     // Get temporary space pointer
     float *temp_weights = static_cast<float*>(temp_space->data);

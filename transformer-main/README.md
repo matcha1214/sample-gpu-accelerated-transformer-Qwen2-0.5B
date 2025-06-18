@@ -52,10 +52,44 @@ Instead, we will implement matrix-vector multiply with standard fused-multiply-a
 What is ratio of BF16 tensor core FLOPS to BF16 non-tensor core FLOPS on an A100-PCIE-40GB GPU?
 Note: NVIDIA and AMD marketing both try to inflate their performance by measuring "sparse" tensor core operations, but nobody uses those.
 
+https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf
+
+"BFLOAT16
+Tensor Core
+312 TFLOPS"
+
+https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf
+
+"
+Peak BF16 TFLOPS
+ (non-Tensor) NVIDIA A100: 39"
+
+Therefore, the ratio of BF16 Tensor Core FLOPS to BF16 non-Tensor Core FLOPS (without sparsity) on an A100-PCIE-40GB GPU is:
+
+312 TFLOPS / 39 TFLOPS = 8
+
 ### Question 1.2 (5 points)
 What is the expected speedup of tensor cores vs non-tensor cores for matrix-vector multiplication on an A100-PCIE-40GB GPU?
 Make an argument based on arithmetic intensity (FLOPS is not the whole story).
 Assume the matrix and vector are read from off-chip memory.
+
+https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf
+
+"1555 GB/sec of memory bandwidth"
+
+AI = FLOPs / Bytes Read
+AI = (2 * M * K) / (2 * K * (M+1))
+AI = M / (M+1) FLOPs/byte
+AI ≈ 1 FLOP/byte
+
+P_MemBound = Memory Bandwidth * Arithmetic Intensity = 1.555 TFLOPS
+
+Perf_NTC = min(39 TFLOPS, 1.555 TFLOPS) Perf_NTC = 1.555 TFLOPS
+Perf_TC = min(312 TFLOPS, 1.555 TFLOPS) Perf_TC = 1.555 TFLOPS
+
+Expected Speedup = Perf_TC / Perf_NTC = 1x
+
+Both the non-Tensor Cores and the Tensor Cores cannot compute faster than the rate at which data is supplied from memory. Since both are capped by the same memory bandwidth limit for this operation, the Tensor Cores offer no significant speedup over non-Tensor Cores for matrix-vector multiplication under these conditions. The bottleneck is not the compute units themselves, but the data pipeline feeding them. Therefore, the expected speedup is negligible.
 
 ### Coding (80 points)
 Implement GPU operators:
@@ -75,6 +109,8 @@ For example:
 - Explain how the performance would be different in another scenario (e.g. longer sequence length, larger model, increased batch size)
 - Explain similarities across the kernels
 
+### see the profiling README
+
 ## Part 2 (second week)
 
 To submit, zip your repository to `~/lab6_2025_submission.zip`.
@@ -83,17 +119,25 @@ To submit, zip your repository to `~/lab6_2025_submission.zip`.
 List all the matrix-vector multiplies in a Qwen2 0.5B layer, including the (M, K) dimensions of the matrix.
 (Do not include grouped-query attention).
 
+A single layer of the Qwen2 0.5B model involves seven key matrix-vector multiplication operations when processing input data. Within the attention mechanism, these include: the query projection, where an (896, 896) matrix transforms the 896-dimensional input hidden state into query vectors; the key projection, using a (128, 896) matrix to produce key vectors from the same input; the value projection, with a (128, 896) matrix creating value vectors; and finally, the output projection, where an (896, 896) matrix combines the attention outputs back into the hidden state dimension. The feed-forward network part of the layer also contains three such operations: a gate projection with a (4864, 896) matrix, an up projection also with a (4864, 896) matrix, and a down projection employing an (896, 4864) matrix to process the activations. The first dimension (M) of these (M, K) pairs indicates the output size, while the second dimension (K) matches the input vector's size.
+
 ### Question 2.2 (2 points)
 Treating each query head as a row of a matrix, what are the dimensions of the matrix-matrix multiply in a
 Qwen2 0.5B layer grouped-query attention operation? Assume current sequence length is 1234 tokens.
+
+In the Qwen2 0.5B model's grouped-query attention mechanism, when processing a sequence of 1234 tokens, the core matrix-matrix multiplication to calculate attention scores can be conceptually viewed as an operation between a (14, 64) query matrix and a (64, 1234) transposed key matrix. This results in a (14, 1234) attention score matrix, where each of the 14 query heads (each 64-dimensional) calculates its relevance to each of the 1234 token positions. While in practice, due to grouped-query attention, these 14 query heads are grouped and share 2 sets of key/value heads (meaning 7 query heads attend to one set of keys/values at a time), this conceptual (14, 1234) output dimension accurately represents the combined attention scores across all query heads for the entire sequence.
 
 ### Question 2.3 (5 points)
 Assuming off-chip memory bandwidth is the limiting factor, what is the theoretical minimum inference latency (in ms)
 for Qwen2 0.5B on an A100-PCIE-40GB, with BF16 weights? Assume small sequence length (i.e. KV cache size is negligible).
 
+The theoretical minimum time (latency) to generate a single token with the Qwen2 0.5B model on an A100-PCIE-40GB GPU, using BF16 precision for its weights and assuming memory bandwidth is the sole bottleneck, is approximately 0.635 milliseconds. This calculation is based on the model's specific size of 494 million parameters, which translates to 988 million bytes (988 MB) when stored in BF16 format (2 bytes per parameter). Given the A100-PCIE-40GB's memory bandwidth of 1,555 GB per second, the latency is found by dividing the total model size in bytes by the memory bandwidth in bytes per second. This figure represents an ideal scenario where data transfer is perfectly efficient and computational overhead is negligible.
+
 ### Question 2.4 (5 points)
 Determine the sequence length at which the KV cache becomes non-negligible in terms of performance;
 specifically, at what sequence length in Qwen2 0.5B would the KV cache become 10% the size of the model parameters?
+
+For the Qwen2 0.5B model, the KV cache (which stores past key and value states for efficient generation) would reach 10% of the total model parameter size at a sequence length of approximately 8,040 tokens. The model has 494 million parameters, amounting to 988 million bytes in BF16 format; 10% of this is 98.8 million bytes. Each token added to the sequence requires storing its key and value vectors across all 24 layers. For Qwen2 0.5B, this means storing 2 key vectors of 64 dimensions each and 2 value vectors of 64 dimensions each, per layer, all in BF16 (2 bytes per value). This sums up to 12,288 bytes per token for the entire KV cache. Dividing the 98.8 million byte threshold by 12,288 bytes per token gives the sequence length where the KV cache size becomes a significant fraction of the model's weight storage.
 
 ### Coding (75 points)
 Complete:
@@ -120,6 +164,8 @@ ncu --set full --nvtx --nvtx-include last_token/ -c100 -o profile ./transformer
 How many microseconds per layer does your implementation take?
 What is the slowest part of the layer and why?
 Include screenshots of the something interesting you notice, and explain.
+
+### see the profiling README
 
 ## Assignment notes
 
@@ -171,6 +217,8 @@ Also, note that passing all test cases does not mean you will get an A.
 The test cases only check for correctness, not for performance.
 If your kernels have needless suboptimal memory access, poor occupancy, or other performance issues,
 the tests will still pass, but you will not get a good grade.
+
+### AI is used for debugging
 
 ## Author
 Sam Foxman 2025

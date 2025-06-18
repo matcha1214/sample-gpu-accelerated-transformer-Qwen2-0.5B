@@ -1,19 +1,18 @@
 #include "MatrixVectorMultiply.cuh"
 #include "../ErrorCheck.h"
 
+// First kernel: Each block calculates partial sums for a set of rows
 template<typename input_float_t>
-__global__ void matmul_kernel_block_reduce(
-    int32_t m, int32_t k, __nv_bfloat16 *mat, __nv_bfloat16 *bias,
-    input_float_t *vec, float *partial_out
-) {
+__global__ void matmul_kernel_partial_sums(int32_t m, int32_t k, __nv_bfloat16 *mat,
+                                           input_float_t *vec, float *partial_results) {
     extern __shared__ char shared_mem[];
-    __nv_bfloat16* s_vec = (__nv_bfloat16*)shared_mem;
-    float* s_partial = (float*)&s_vec[k];
-
+    __nv_bfloat16 *s_vec = (__nv_bfloat16*)shared_mem;
+    
     int tid = threadIdx.x;
-    int block_id = blockIdx.x;
-
-    // 1. Load vector into shared memory (cooperatively)
+    int bid = blockIdx.x;
+    int num_blocks = gridDim.x;
+    
+    // Step 1: Cooperatively load vector into shared memory
     for (int i = tid; i < k; i += blockDim.x) {
         if constexpr (std::is_same_v<input_float_t, __nv_bfloat16>) {
             s_vec[i] = vec[i];
@@ -22,96 +21,145 @@ __global__ void matmul_kernel_block_reduce(
         }
     }
     __syncthreads();
-
-    // 2. Each block processes a subset of rows
-    int rows_per_block = (m + gridDim.x - 1) / gridDim.x;
-    int start_row = block_id * rows_per_block;
-    int end_row = min(start_row + rows_per_block, m);
-
-    for (int row = start_row; row < end_row; row++) {
-        float thread_sum = 0.0f;
-
-        // 3. Each thread processes a chunk of 'k'
+    
+    // Each block processes a strided set of rows for better load balancing
+    for (int row = bid; row < m; row += num_blocks) {
+        float sum = 0.0f;
+        
+        // Each thread processes k/blockDim.x elements of this row
         for (int col = tid; col < k; col += blockDim.x) {
+            // Load matrix element
             __nv_bfloat16 mat_val = mat[row * k + col];
+            
+            // Read corresponding vector value from shared memory
             __nv_bfloat16 vec_val = s_vec[col];
-            thread_sum += __bfloat162float(mat_val) * __bfloat162float(vec_val);
+            
+            // Perform elementwise multiplication and accumulate
+            sum += __bfloat162float(mat_val) * __bfloat162float(vec_val);
         }
-
-        // 4. Store thread_sum into shared memory for block reduction
-        s_partial[tid] = thread_sum;
+        
+        // Use shared memory for block-level reduction
+        __shared__ float s_reduction[1024]; // Assuming max 1024 threads per block
+        s_reduction[tid] = sum;
         __syncthreads();
-
-        // 5. Parallel reduction within block
+        
+        // Parallel reduction within block
         for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
             if (tid < stride) {
-                s_partial[tid] += s_partial[tid + stride];
+                s_reduction[tid] += s_reduction[tid + stride];
             }
             __syncthreads();
         }
-
-        // 6. Write partial sum to global memory
+        
+        // Write partial sum to global memory
         if (tid == 0) {
-            // Each block writes its partial sum for this row
-            partial_out[row * gridDim.x + block_id] = s_partial[0];
+            partial_results[row * num_blocks + bid] = s_reduction[0];
         }
-        __syncthreads();
     }
 }
 
-// Stage 2: Final reduction kernel (sum across blocks for each row)
-__global__ void matmul_kernel_block_reduce_finalize(
-    int32_t m, int32_t num_blocks, float *partial_out, __nv_bfloat16 *bias, __nv_bfloat16 *out
-) {
+// Second kernel: Reduce partial sums and apply bias
+__global__ void reduce_partial_sums_kernel(int32_t m, int32_t num_blocks, 
+                                           float *partial_results, __nv_bfloat16 *bias, 
+                                           __nv_bfloat16 *out) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
+    
     if (row < m) {
         float sum = 0.0f;
-        for (int blk = 0; blk < num_blocks; ++blk) {
-            sum += partial_out[row * num_blocks + blk];
+        
+        // Sum all partial results for this row
+        for (int b = 0; b < num_blocks; b++) {
+            sum += partial_results[row * num_blocks + b];
         }
+        
+        // Add bias if provided
         if (bias != nullptr) {
             sum += __bfloat162float(bias[row]);
         }
+        
+        // Write final result
+        out[row] = __float2bfloat16(sum);
+    }
+}
+
+// Simplified version for small matrices (unchanged)
+template<typename input_float_t>
+__global__ void matmul_kernel_simple(int32_t m, int32_t k, __nv_bfloat16 *mat, __nv_bfloat16 *bias,
+                                    input_float_t *vec, __nv_bfloat16 *out) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m) {
+        float sum = 0.0f;
+        
+        // Add bias if provided
+        if (bias != nullptr) {
+            sum = __bfloat162float(bias[row]);
+        }
+        
+        // Compute dot product
+        for (int col = 0; col < k; col++) {
+            float mat_val = __bfloat162float(mat[row * k + col]);
+            float vec_val;
+            
+            if constexpr (std::is_same_v<input_float_t, __nv_bfloat16>) {
+                vec_val = __bfloat162float(vec[col]);
+            } else {
+                vec_val = vec[col];
+            }
+            
+            sum += mat_val * vec_val;
+        }
+        
         out[row] = __float2bfloat16(sum);
     }
 }
 
 template<typename input_float_t>
-void MatrixVectorMultiply::bf16_matmul(
-    int32_t m, int32_t k, __nv_bfloat16 *mat, __nv_bfloat16 *bias,
-    input_float_t *vec, __nv_bfloat16 *out, cudaStream_t stream
-) {
-    // Use two-stage reduction for large matrices where more blocks are needed
-    int block_size = 256;
-    int max_blocks = 65535; // CUDA limit
-    int grid_size = min((m + block_size - 1) / block_size, max_blocks);
-
-    size_t vector_size = k * sizeof(__nv_bfloat16);
-    size_t partial_sums_size = block_size * sizeof(float);
-    size_t shared_mem_size = vector_size + partial_sums_size;
-
-    if (k > 1024 && m > 1024 && shared_mem_size <= 48 * 1024) {
-        // Stage 1: Compute partial sums
-        float *partial_out;
-        cudaMalloc(&partial_out, sizeof(float) * m * grid_size);
-
-        matmul_kernel_block_reduce<input_float_t><<<grid_size, block_size, shared_mem_size, stream>>>(
-            m, k, mat, bias, vec, partial_out
-        );
-
-        // Stage 2: Final reduction
-        int red_grid = (m + block_size - 1) / block_size;
-        matmul_kernel_block_reduce_finalize<<<red_grid, block_size, 0, stream>>>(
-            m, grid_size, partial_out, bias, out
-        );
-
-        cudaFree(partial_out);
+void MatrixVectorMultiply::bf16_matmul(int32_t m, int32_t k, __nv_bfloat16 *mat, __nv_bfloat16 *bias,
+                                      input_float_t *vec, __nv_bfloat16 *out, cudaStream_t stream) {
+    if (k > 1024 && m > 1024) {
+        // Use the two-phase approach with cross-block reduction for larger matrices
+        int32_t block_size = 256;
+        
+        // Limit the number of blocks for better occupancy
+        int32_t num_blocks = min(32, (m + 31)/32); // Use at most 32 blocks per row
+        
+        // Calculate shared memory size for vector
+        size_t shared_mem_size = k * sizeof(__nv_bfloat16);
+        
+        // Check shared memory limits (typically 48KB per block)
+        if (shared_mem_size <= 48 * 1024) {
+            // Allocate temporary storage for partial results
+            float *partial_results;
+            cudaMalloc(&partial_results, m * num_blocks * sizeof(float));
+            
+            // Launch first kernel to compute partial sums
+            matmul_kernel_partial_sums<<<num_blocks, block_size, shared_mem_size, stream>>>(
+                m, k, mat, vec, partial_results);
+            checkCuda(cudaPeekAtLastError());
+            
+            // Launch second kernel to reduce partial sums and apply bias
+            int reduce_block_size = 256;
+            int reduce_grid_size = (m + reduce_block_size - 1) / reduce_block_size;
+            
+            reduce_partial_sums_kernel<<<reduce_grid_size, reduce_block_size, 0, stream>>>(
+                m, num_blocks, partial_results, bias, out);
+            checkCuda(cudaPeekAtLastError());
+            
+            // Free temporary storage
+            cudaFree(partial_results);
+        } else {
+            // Fall back to simple version if vector too large for shared memory
+            int32_t grid_size = (m + block_size - 1) / block_size;
+            matmul_kernel_simple<<<grid_size, block_size, 0, stream>>>(
+                m, k, mat, bias, vec, out);
+        }
     } else {
-        // Fallback to simple kernel for smaller matrices or memory constraints
-        int grid = (m + block_size - 1) / block_size;
-        matmul_kernel_simple<input_float_t><<<grid, block_size, 0, stream>>>(
-            m, k, mat, bias, vec, out
-        );
+        // Use simple version for smaller matrices
+        int32_t block_size = 256;
+        int32_t grid_size = (m + block_size - 1) / block_size;
+        matmul_kernel_simple<<<grid_size, block_size, 0, stream>>>(
+            m, k, mat, bias, vec, out);
     }
 }
 

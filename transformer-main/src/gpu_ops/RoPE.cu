@@ -17,7 +17,6 @@ __global__ void rope_kernel(__nv_bfloat16 *x, int32_t num_heads, int32_t head_di
     int head_idx = blockIdx.x;
     int dim_pair_idx = threadIdx.x;  // which pair of dimensions (0, head_dim/2), (1, head_dim/2+1), etc.
     
-    // Boundary check - ensure we don't exceed the number of heads or dimension pairs
     if (head_idx >= num_heads || dim_pair_idx >= head_dim / 2) return;
     
     // Calculate the base frequency for this dimension pair
@@ -46,7 +45,6 @@ __global__ void rope_kernel(__nv_bfloat16 *x, int32_t num_heads, int32_t head_di
     float x2 = __bfloat162float(x[idx2]);
     
     // Apply the 2D rotation transformation
-    // This is the core RoPE operation: rotating in the (x1, x2) plane
     float rotated_x1 = x1 * cos_val - x2 * sin_val;
     float rotated_x2 = x1 * sin_val + x2 * cos_val;
     
@@ -59,13 +57,10 @@ void RoPE::apply_rope_to_qk(__nv_bfloat16 *x, int32_t num_heads, int32_t head_di
                            int32_t position_idx, float theta_base, cudaStream_t stream) {
     // Grid configuration: one block per head
     // Block configuration: one thread per dimension pair
-    // This gives us optimal parallelism - each head is processed independently,
-    // and within each head, all dimension pairs are rotated simultaneously
     dim3 grid_dim(num_heads);
     dim3 block_dim(head_dim / 2);
     
     // Launch the kernel
-    // Note: No shared memory needed since each thread works on independent data
     rope_kernel<<<grid_dim, block_dim, 0, stream>>>(
         x, num_heads, head_dim, position_idx, theta_base);
 }
