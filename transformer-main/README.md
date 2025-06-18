@@ -4,8 +4,7 @@ Caltech CS179 Transformer Project
 
 final score for the current implementation: 98/100
 
--1: superfluous add kernel 
--1: incorrect implementation, query head should be divided by kv heads
+-2: superfluous add kernel 
 
 # Background
 
